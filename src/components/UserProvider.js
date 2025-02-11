@@ -1,18 +1,5 @@
 import React, { createContext, useEffect, useMemo, useState } from 'react';
-import { getAuth, onAuthStateChanged, signInWithPopup, signOut, GoogleAuthProvider } from 'firebase/auth';
-// import { useAuthState } from 'react-firebase-hooks/auth'; // Consider using react-firebase-hooks
-// import firebase from 'firebase/app'; // Assuming you have firebase configured
-import { initializeApp as firebaseInitializeApp } from 'firebase/app';
-import {
-  getFirestore,
-  doc,
-  getDoc,
-  updateDoc,
-  setDoc,
-  arrayRemove,
-  arrayUnion
-} from 'firebase/firestore/lite';
-import firebaseConfig from '../config/firebaseConfig';
+import axios from 'axios';
 
 const UserContext = createContext({
   user: null,
@@ -28,8 +15,8 @@ const UserContext = createContext({
 
 /**
  * Convert favorites from list of path strings to list of objects.
- * As of July 2024, the converted objects are not persisted to Firebase.
- * Only new favorites are saved to Firebase in the object form.
+ * As of July 2024, the converted objects are not persisted to the backend.
+ * Only new favorites are saved to the backend in the object form.
  *
  * {
  *   path: 'https://web.site/music/game/song.vgm',
@@ -52,134 +39,131 @@ function migrateFaves(faves) {
 }
 
 const UserProvider = ({ children }) => {
-  // Use authState hook for user state
-  // const [authUser, userLoading] = useAuthState(firebase.auth());
   const [user, setUser] = useState(null); // Local state for user data
   const [faves, setFaves] = useState([]);
   const [showPlayerSettings, setShowPlayerSettings] = useState(false);
   const [loadingUser, setLoadingUser] = useState(true); // Manage loading state
 
-  useEffect(() => {
-    // Initialize Firebase
-    const firebaseApp = firebaseInitializeApp(firebaseConfig);
-    const auth = getAuth(firebaseApp);
-    const db = getFirestore(firebaseApp);
-    onAuthStateChanged(auth, user => {
-      setUser(user);
+  // Fetch user data from backend
+  const fetchUserData = async (userId) => {
+    try {
+      const response = await axios.get(`/api/users/${userId}`);
+      const faves = migrateFaves(response.data.faves || []);
+      setFaves(faves);
+      setShowPlayerSettings(response.data.settings?.showPlayerSettings || false);
+    } catch (error) {
+      console.error('Error fetching user data:', error);
+    } finally {
       setLoadingUser(false);
-      if (user) {
-        const docRef = doc(db, 'users', user.uid);
-        getDoc(docRef)
-          .then(userSnapshot => {
-            if (!userSnapshot.exists()) {
-              // Create user
-              console.debug('Creating user document', user.uid);
-              setDoc(docRef, {
-                faves: [],
-                settings: {},
-              });
-            } else {
-              // Restore user
-              const data = userSnapshot.data();
-              const faves = migrateFaves(data.faves || []);
-              setFaves(faves);
-              setShowPlayerSettings(data.settings?.showPlayerSettings || false);
-            }
-          });
+    }
+  };
+
+  // Check if user is logged in (e.g., via token or session)
+  useEffect(() => {
+    const checkAuthStatus = async () => {
+      try {
+        const response = await axios.get('/api/auth/status');
+        setUser(response.data);
+        fetchUserData(response.data.id); // Fetch user-specific data
+      } catch (error) {
+        setUser(null);
+        setLoadingUser(false);
       }
-    });
+    };
+
+    checkAuthStatus();
   }, []);
 
   const handleLogin = async () => {
-    const auth = getAuth();
-    const provider = new GoogleAuthProvider();
     try {
-      const result = await signInWithPopup(auth, provider);
-      console.log('Firebase auth result:', result);
-      // Update user state based on result
+      // Redirect to backend login endpoint (e.g., OAuth or custom login)
+      //window.location.href = '/api/auth/login';
+      const data = {
+        username: "admin",
+        password: "123"
+      };
+      await axios.post(`/user/login`, data);
     } catch (error) {
-      console.log('Firebase auth error:', error);
+      console.error('Login error:', error);
     }
   };
 
   const handleLogout = async () => {
-    const auth = getAuth();
     try {
-      await signOut(auth);
+      await axios.post('/api/auth/logout');
       setUser(null);
       setFaves([]);
     } catch (error) {
-      console.log('Firebase logout error:', error);
+      console.error('Logout error:', error);
     }
   };
 
   const handleToggleFavorite = async (href) => {
     if (user) {
-      const userRef = doc(getFirestore(), 'users', user.uid);
-      let newFaves, favesOp;
       const oldFaves = faves;
       const existingIdx = oldFaves.findLastIndex(f => f === href || f.href === href);
+      let newFaves;
+
       if (existingIdx === -1) {
         // ADD
         const newFave = {
           href,
           mtime: Math.floor(Date.now() / 1000),
-        }
+        };
         newFaves = [...oldFaves, newFave];
-        favesOp = arrayUnion(newFave);
       } else {
         // REMOVE
-        // Firebase cannot remove from array by index, only by value.
-        // Remove both the object and href (for legacy favorites).
-        const element = oldFaves[existingIdx];
         newFaves = oldFaves.toSpliced(existingIdx, 1);
-        favesOp = arrayRemove(element, element.href);
       }
+
       // Optimistic update
       setFaves(newFaves);
+
       try {
-        await updateDoc(userRef, { faves: favesOp });
-      } catch (e) {
-        setFaves(oldFaves);
-        console.log('Couldn\'t update favorites in Firebase.', e);
+        await axios.post(`/api/users/${user.id}/favorites`, { faves: newFaves });
+      } catch (error) {
+        setFaves(oldFaves); // Rollback on error
+        console.error('Failed to update favorites:', error);
       }
     }
   };
 
-  const handleToggleSettings = () => {
-    // Optimistic update
+  const handleToggleSettings = async () => {
     const newShowPlayerSettings = !showPlayerSettings;
     setShowPlayerSettings(newShowPlayerSettings);
 
     if (user) {
-      const userRef = doc(getFirestore(), 'users', user.uid);
-      updateDoc(userRef, { settings: { showPlayerSettings: newShowPlayerSettings } })
-        .catch((e) => {
-          console.log('Couldn\'t update settings in Firebase.', e);
+      try {
+        await axios.post(`/api/users/${user.id}/settings`, {
+          showPlayerSettings: newShowPlayerSettings,
         });
+      } catch (error) {
+        console.error('Failed to update settings:', error);
+      }
     }
-  }
+  };
 
-  // We need to derive a list of hrefs to use as the play context.
+  // Derive a list of hrefs to use as the play context
   const favesContext = useMemo(() => {
     return faves.map(fave => fave.href);
   }, [faves]);
 
   return (
-    <UserContext.Provider
-      value={{
-        user,
-        loadingUser,
-        faves,
-        favesContext,
-        showPlayerSettings,
-        handleLogin,
-        handleLogout,
-        handleToggleFavorite,
-        handleToggleSettings,
-      }}>
-      {children}
-    </UserContext.Provider>
+      <UserContext.Provider
+          value={{
+            user,
+            loadingUser,
+            faves,
+            favesContext,
+            showPlayerSettings,
+            handleLogin,
+            handleLogout,
+            handleToggleFavorite,
+            handleToggleSettings,
+          }}
+      >
+        {children}
+      </UserContext.Provider>
   );
 };
 
